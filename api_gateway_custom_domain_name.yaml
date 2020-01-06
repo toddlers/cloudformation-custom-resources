@@ -1,0 +1,142 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Parameters:
+  APIGatewayCustomDomainName:
+    Type: String
+    Description: "Custom domain name for APIGateway"
+    Default: "my-api.example.com"
+  CertificateArn:
+    Type: String
+
+Resources:
+  apiGateway:
+    Type: "AWS::ApiGateway::RestApi"
+    Properties:
+      Name: "myapi"
+      Description: "My API"
+      FailOnWarnings: "true"
+  apiGatewayRootMethod:
+    Type: "AWS::ApiGateway::Method"
+    Properties:
+      AuthorizationType: "NONE"
+      HttpMethod: "POST"
+      Integration:
+        IntegrationHttpMethod: "POST"
+        Type: "AWS_PROXY"
+        Uri: !Sub
+          - "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${lambdaArn}/invocations"
+          - lambdaArn: !GetAtt "StoreDeviceLamda.Arn"
+      ResourceId: !GetAtt "apiGateway.RootResourceId"
+      RestApiId: !Ref "apiGateway"
+
+  RestApiDeployment:
+    Type: "AWS::ApiGateway::Deployment"
+    DependsOn:
+      - apiGatewayRootMethod
+    Properties:
+      RestApiId: !Ref "apiGateway"
+      StageName: "v2"
+
+  lambdaApiGatewayInvoke:
+    Type: "AWS::Lambda::Permission"
+    Properties:
+      Action: "lambda:InvokeFunction"
+      FunctionName: !GetAtt "StoreDeviceLamda.Arn"
+      Principal: "apigateway.amazonaws.com"
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${apiGateway}/*/POST/"
+
+  StoreDeviceLamda:
+    Type: "AWS::Lambda::Function"
+    Properties:
+      Code:
+        ZipFile: |
+          def handler(event, context):
+            print(json.dumps(event))
+              return {"statusCode": "200", "body": "ok", "headers": {"Content-Type": "application/json"}}
+      Description: "My function"
+      FunctionName: "StoreDeviceLamda"
+      Handler: "index.handler"
+      MemorySize: 128
+      Role: !GetAtt "LambdaRole.Arn"
+      Runtime: "python3.7"
+      Timeout: 10   
+  GatewayDomainName:
+    Type: "AWS::Lambda::Function"
+    Properties:
+      Description: "CloudFormation Function"
+      FunctionName: "mycustom-resource"
+      Handler: "index.lambda_handler"
+      Code:
+        ZipFile: |
+          import cfnresponse
+          import boto3
+          import json
+          api_gw = boto3.client('apigateway')
+          def lambda_handler(event, context):
+            print(f"Data in event: {event}")
+            response_data = {}
+            if event["RequestType"] == "Create":
+              domain_name = event["ResourceProperties"]["DomainName"]
+              response = api_gw.get_domain_name(domainName=domain_name)
+              physicalResourceId = event["PhysicalResourceId"]
+              response_data = {
+                RegionalDomainName: response["regionalDomainName"],
+                RegionalHostedZoneId: response["regionalHostedZoneId"],
+                DistributionDomainName: response["distributionDomainName"],
+                DistributionHostedZoneId: response["distributionHostedZoneId"]
+              }
+            else: # if event["RequestType"] == "Update" or event["RequestType"] == "Delete":
+              physicalResourceId = event["PhysicalResourceId"]
+
+            cfnresponse.send(event, context, cfnresponse.SUCCESS, response_data, physicalResourceId)
+      Role: !GetAtt "LambdaRole.Arn"
+      Runtime: "python3.7"
+      Timeout: 60   
+      
+  LambdaRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Action:
+              - "sts:AssumeRole"
+            Effect: "Allow"
+            Principal:
+              Service:
+                - "lambda.amazonaws.com"
+      Policies:
+        - PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Action:
+                  - "logs:*"
+                  - "lambda:*"
+                  - "apigateway:*"
+                Effect: "Allow"
+                Resource: "*"
+          PolicyName: "lambda"
+
+  ApiDomain:
+    Type: "AWS::ApiGateway::DomainName"
+    Properties:
+      RegionalCertificateArn: !Ref CertificateArn
+      DomainName: !Sub "${APIGatewayCustomDomainName}"
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+
+  ApiMapping:
+    Type: "AWS::ApiGateway::BasePathMapping"
+    DependsOn:
+      - RestApiDeployment
+    Properties:
+      BasePath: v2
+      DomainName: !Ref ApiDomain
+      RestApiId: !Ref "apiGateway"
+      Stage: v2
+
+  ApiDomainInfo:
+    Type: "Custom::GetApiGatewayDomain"
+    Properties:
+      ServiceToken: !GetAtt GatewayDomainName.Arn
+      DomainName: !Ref ApiDomain
